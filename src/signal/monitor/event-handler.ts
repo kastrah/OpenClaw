@@ -7,10 +7,6 @@ import {
   resolveEnvelopeFormatOptions,
 } from "../../auto-reply/envelope.js";
 import {
-  createInboundDebouncer,
-  resolveInboundDebounceMs,
-} from "../../auto-reply/inbound-debounce.js";
-import {
   buildPendingHistoryContextFromMap,
   clearHistoryEntriesIfEnabled,
   recordPendingHistoryEntryIfEnabled,
@@ -19,6 +15,10 @@ import { finalizeInboundContext } from "../../auto-reply/reply/inbound-context.j
 import { buildMentionRegexes, matchesMentionPatterns } from "../../auto-reply/reply/mentions.js";
 import { createReplyDispatcherWithTyping } from "../../auto-reply/reply/reply-dispatcher.js";
 import { resolveControlCommandGate } from "../../channels/command-gating.js";
+import {
+  createChannelInboundDebouncer,
+  shouldDebounceTextInbound,
+} from "../../channels/inbound-debounce-policy.js";
 import { logInboundDrop, logTypingFailure } from "../../channels/logging.js";
 import { resolveMentionGatingWithBypass } from "../../channels/mention-gating.js";
 import { normalizeSignalMessagingTarget } from "../../channels/plugins/normalize/signal.js";
@@ -29,15 +29,19 @@ import { resolveChannelGroupRequireMention } from "../../config/group-policy.js"
 import { readSessionUpdatedAt, resolveStorePath } from "../../config/sessions.js";
 import { danger, logVerbose, shouldLogVerbose } from "../../globals.js";
 import { enqueueSystemEvent } from "../../infra/system-events.js";
-import { mediaKindFromMime } from "../../media/constants.js";
+import { kindFromMime } from "../../media/mime.js";
 import { resolveAgentRoute } from "../../routing/resolve-route.js";
-import { DM_GROUP_ACCESS_REASON } from "../../security/dm-policy-shared.js";
+import {
+  DM_GROUP_ACCESS_REASON,
+  resolvePinnedMainDmOwnerFromAllowlist,
+} from "../../security/dm-policy-shared.js";
 import { normalizeE164 } from "../../utils.js";
 import {
   formatSignalPairingIdLine,
   formatSignalSenderDisplay,
   formatSignalSenderId,
   isSignalSenderAllowed,
+  normalizeSignalAllowRecipient,
   resolveSignalPeerId,
   resolveSignalRecipient,
   resolveSignalSender,
@@ -52,9 +56,45 @@ import type {
   SignalReceivePayload,
 } from "./event-handler.types.js";
 import { renderSignalMentions } from "./mentions.js";
-export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
-  const inboundDebounceMs = resolveInboundDebounceMs({ cfg: deps.cfg, channel: "signal" });
 
+function formatAttachmentKindCount(kind: string, count: number): string {
+  if (kind === "attachment") {
+    return `${count} file${count > 1 ? "s" : ""}`;
+  }
+  return `${count} ${kind}${count > 1 ? "s" : ""}`;
+}
+
+function formatAttachmentSummaryPlaceholder(contentTypes: Array<string | undefined>): string {
+  const kindCounts = new Map<string, number>();
+  for (const contentType of contentTypes) {
+    const kind = kindFromMime(contentType) ?? "attachment";
+    kindCounts.set(kind, (kindCounts.get(kind) ?? 0) + 1);
+  }
+  const parts = [...kindCounts.entries()].map(([kind, count]) =>
+    formatAttachmentKindCount(kind, count),
+  );
+  return `[${parts.join(" + ")} attached]`;
+}
+
+function resolveSignalInboundRoute(params: {
+  cfg: SignalEventHandlerDeps["cfg"];
+  accountId: SignalEventHandlerDeps["accountId"];
+  isGroup: boolean;
+  groupId?: string;
+  senderPeerId: string;
+}) {
+  return resolveAgentRoute({
+    cfg: params.cfg,
+    channel: "signal",
+    accountId: params.accountId,
+    peer: {
+      kind: params.isGroup ? "group" : "direct",
+      id: params.isGroup ? (params.groupId ?? "unknown") : params.senderPeerId,
+    },
+  });
+}
+
+export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
   type SignalInboundEntry = {
     senderName: string;
     senderDisplay: string;
@@ -69,6 +109,8 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
     messageId?: string;
     mediaPath?: string;
     mediaType?: string;
+    mediaPaths?: string[];
+    mediaTypes?: string[];
     commandAuthorized: boolean;
     wasMentioned?: boolean;
   };
@@ -82,14 +124,12 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
       directLabel: entry.senderName,
       directId: entry.senderDisplay,
     });
-    const route = resolveAgentRoute({
+    const route = resolveSignalInboundRoute({
       cfg: deps.cfg,
-      channel: "signal",
       accountId: deps.accountId,
-      peer: {
-        kind: entry.isGroup ? "group" : "direct",
-        id: entry.isGroup ? (entry.groupId ?? "unknown") : entry.senderPeerId,
-      },
+      isGroup: entry.isGroup,
+      groupId: entry.groupId,
+      senderPeerId: entry.senderPeerId,
     });
     const storePath = resolveStorePath(deps.cfg.session?.store, {
       agentId: route.agentId,
@@ -168,6 +208,9 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
       MediaPath: entry.mediaPath,
       MediaType: entry.mediaType,
       MediaUrl: entry.mediaPath,
+      MediaPaths: entry.mediaPaths,
+      MediaUrls: entry.mediaPaths,
+      MediaTypes: entry.mediaTypes,
       WasMentioned: entry.isGroup ? entry.wasMentioned === true : undefined,
       CommandAuthorized: entry.commandAuthorized,
       OriginatingChannel: "signal" as const,
@@ -184,6 +227,25 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
             channel: "signal",
             to: entry.senderRecipient,
             accountId: route.accountId,
+            mainDmOwnerPin: (() => {
+              const pinnedOwner = resolvePinnedMainDmOwnerFromAllowlist({
+                dmScope: deps.cfg.session?.dmScope,
+                allowFrom: deps.allowFrom,
+                normalizeEntry: normalizeSignalAllowRecipient,
+              });
+              if (!pinnedOwner) {
+                return undefined;
+              }
+              return {
+                ownerRecipient: pinnedOwner,
+                senderRecipient: entry.senderRecipient,
+                onSkip: ({ ownerRecipient, senderRecipient }) => {
+                  logVerbose(
+                    `signal: skip main-session last route for ${senderRecipient} (pinned owner ${ownerRecipient})`,
+                  );
+                },
+              };
+            })(),
           }
         : undefined,
       onRecordError: (err) => {
@@ -276,8 +338,9 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
     }
   }
 
-  const inboundDebouncer = createInboundDebouncer<SignalInboundEntry>({
-    debounceMs: inboundDebounceMs,
+  const { debouncer: inboundDebouncer } = createChannelInboundDebouncer<SignalInboundEntry>({
+    cfg: deps.cfg,
+    channel: "signal",
     buildKey: (entry) => {
       const conversationId = entry.isGroup ? (entry.groupId ?? "unknown") : entry.senderPeerId;
       if (!conversationId || !entry.senderPeerId) {
@@ -286,13 +349,11 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
       return `signal:${deps.accountId}:${conversationId}:${entry.senderPeerId}`;
     },
     shouldDebounce: (entry) => {
-      if (!entry.bodyText.trim()) {
-        return false;
-      }
-      if (entry.mediaPath || entry.mediaType) {
-        return false;
-      }
-      return !hasControlCommand(entry.bodyText, deps.cfg);
+      return shouldDebounceTextInbound({
+        text: entry.bodyText,
+        cfg: deps.cfg,
+        hasMedia: Boolean(entry.mediaPath || entry.mediaType || entry.mediaPaths?.length),
+      });
     },
     onFlush: async (entries) => {
       const last = entries.at(-1);
@@ -315,6 +376,8 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
         bodyText: combinedText,
         mediaPath: undefined,
         mediaType: undefined,
+        mediaPaths: undefined,
+        mediaTypes: undefined,
       });
     },
     onError: (err) => {
@@ -365,14 +428,12 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
     }
 
     const senderPeerId = resolveSignalPeerId(params.sender);
-    const route = resolveAgentRoute({
+    const route = resolveSignalInboundRoute({
       cfg: deps.cfg,
-      channel: "signal",
       accountId: deps.accountId,
-      peer: {
-        kind: isGroup ? "group" : "direct",
-        id: isGroup ? (groupId ?? "unknown") : senderPeerId,
-      },
+      isGroup,
+      groupId,
+      senderPeerId,
     });
     const groupLabel = isGroup ? `${groupName ?? "Signal Group"} id:${groupId}` : undefined;
     const messageId = params.reaction.targetSentTimestamp
@@ -563,14 +624,12 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
       return;
     }
 
-    const route = resolveAgentRoute({
+    const route = resolveSignalInboundRoute({
       cfg: deps.cfg,
-      channel: "signal",
       accountId: deps.accountId,
-      peer: {
-        kind: isGroup ? "group" : "direct",
-        id: isGroup ? (groupId ?? "unknown") : senderPeerId,
-      },
+      isGroup,
+      groupId,
+      senderPeerId,
     });
     const mentionRegexes = buildMentionRegexes(deps.cfg, route.agentId);
     const wasMentioned = isGroup && matchesMentionPatterns(messageText, mentionRegexes);
@@ -612,8 +671,14 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
         if (deps.ignoreAttachments) {
           return "<media:attachment>";
         }
+        const attachmentTypes = (dataMessage.attachments ?? []).map((attachment) =>
+          typeof attachment?.contentType === "string" ? attachment.contentType : undefined,
+        );
+        if (attachmentTypes.length > 1) {
+          return formatAttachmentSummaryPlaceholder(attachmentTypes);
+        }
         const firstContentType = dataMessage.attachments?.[0]?.contentType;
-        const pendingKind = mediaKindFromMime(firstContentType ?? undefined);
+        const pendingKind = kindFromMime(firstContentType ?? undefined);
         return pendingKind ? `<media:${pendingKind}>` : "<media:attachment>";
       })();
       const pendingBodyText = messageText || pendingPlaceholder || quoteText;
@@ -635,32 +700,49 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
 
     let mediaPath: string | undefined;
     let mediaType: string | undefined;
+    const mediaPaths: string[] = [];
+    const mediaTypes: string[] = [];
     let placeholder = "";
-    const firstAttachment = dataMessage.attachments?.[0];
-    if (firstAttachment?.id && !deps.ignoreAttachments) {
-      try {
-        const fetched = await deps.fetchAttachment({
-          baseUrl: deps.baseUrl,
-          account: deps.account,
-          attachment: firstAttachment,
-          sender: senderRecipient,
-          groupId,
-          maxBytes: deps.mediaMaxBytes,
-        });
-        if (fetched) {
-          mediaPath = fetched.path;
-          mediaType = fetched.contentType ?? firstAttachment.contentType ?? undefined;
+    const attachments = dataMessage.attachments ?? [];
+    if (!deps.ignoreAttachments) {
+      for (const attachment of attachments) {
+        if (!attachment?.id) {
+          continue;
         }
-      } catch (err) {
-        deps.runtime.error?.(danger(`attachment fetch failed: ${String(err)}`));
+        try {
+          const fetched = await deps.fetchAttachment({
+            baseUrl: deps.baseUrl,
+            account: deps.account,
+            attachment,
+            sender: senderRecipient,
+            groupId,
+            maxBytes: deps.mediaMaxBytes,
+          });
+          if (fetched) {
+            mediaPaths.push(fetched.path);
+            mediaTypes.push(
+              fetched.contentType ?? attachment.contentType ?? "application/octet-stream",
+            );
+            if (!mediaPath) {
+              mediaPath = fetched.path;
+              mediaType = fetched.contentType ?? attachment.contentType ?? undefined;
+            }
+          }
+        } catch (err) {
+          deps.runtime.error?.(danger(`attachment fetch failed: ${String(err)}`));
+        }
       }
     }
 
-    const kind = mediaKindFromMime(mediaType ?? undefined);
-    if (kind) {
-      placeholder = `<media:${kind}>`;
-    } else if (dataMessage.attachments?.length) {
-      placeholder = "<media:attachment>";
+    if (mediaPaths.length > 1) {
+      placeholder = formatAttachmentSummaryPlaceholder(mediaTypes);
+    } else {
+      const kind = kindFromMime(mediaType ?? undefined);
+      if (kind) {
+        placeholder = `<media:${kind}>`;
+      } else if (attachments.length) {
+        placeholder = "<media:attachment>";
+      }
     }
 
     const bodyText = messageText || placeholder || dataMessage.quote?.text?.trim() || "";
@@ -710,6 +792,8 @@ export function createSignalEventHandler(deps: SignalEventHandlerDeps) {
       messageId,
       mediaPath,
       mediaType,
+      mediaPaths: mediaPaths.length > 0 ? mediaPaths : undefined,
+      mediaTypes: mediaTypes.length > 0 ? mediaTypes : undefined,
       commandAuthorized,
       wasMentioned: effectiveWasMentioned,
     });

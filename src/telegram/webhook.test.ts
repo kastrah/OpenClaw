@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto";
 import { once } from "node:events";
-import { request } from "node:http";
+import { request, type IncomingMessage } from "node:http";
 import { setTimeout as sleep } from "node:timers/promises";
 import { describe, expect, it, vi } from "vitest";
 import { startTelegramWebhook } from "./webhook.js";
@@ -23,6 +23,22 @@ const WEBHOOK_POST_TIMEOUT_MS = process.platform === "win32" ? 20_000 : 8_000;
 const TELEGRAM_TOKEN = "tok";
 const TELEGRAM_SECRET = "secret";
 const TELEGRAM_WEBHOOK_PATH = "/hook";
+
+function collectResponseBody(
+  res: IncomingMessage,
+  onDone: (payload: { statusCode: number; body: string }) => void,
+): void {
+  const chunks: Buffer[] = [];
+  res.on("data", (chunk: Buffer | string) => {
+    chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
+  });
+  res.on("end", () => {
+    onDone({
+      statusCode: res.statusCode ?? 0,
+      body: Buffer.concat(chunks).toString("utf-8"),
+    });
+  });
+}
 
 vi.mock("grammy", async (importOriginal) => {
   const actual = await importOriginal<typeof import("grammy")>();
@@ -70,6 +86,70 @@ async function postWebhookJson(params: {
     },
     params.timeoutMs ?? 5_000,
   );
+}
+
+async function postWebhookHeadersOnly(params: {
+  port: number;
+  path: string;
+  declaredLength: number;
+  secret?: string;
+  timeoutMs?: number;
+}): Promise<{ statusCode: number; body: string }> {
+  return await new Promise((resolve, reject) => {
+    let settled = false;
+    const finishResolve = (value: { statusCode: number; body: string }) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      resolve(value);
+    };
+    const finishReject = (error: unknown) => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeout);
+      reject(error);
+    };
+
+    const req = request(
+      {
+        hostname: "127.0.0.1",
+        port: params.port,
+        path: params.path,
+        method: "POST",
+        headers: {
+          "content-type": "application/json",
+          "content-length": String(params.declaredLength),
+          ...(params.secret ? { "x-telegram-bot-api-secret-token": params.secret } : {}),
+        },
+      },
+      (res) => {
+        collectResponseBody(res, (payload) => {
+          finishResolve(payload);
+          req.destroy();
+        });
+      },
+    );
+
+    const timeout = setTimeout(() => {
+      req.destroy(
+        new Error(`webhook header-only post timed out after ${params.timeoutMs ?? 5_000}ms`),
+      );
+      finishReject(new Error("timed out waiting for webhook response"));
+    }, params.timeoutMs ?? 5_000);
+
+    req.on("error", (error) => {
+      if (settled && (error as NodeJS.ErrnoException).code === "ECONNRESET") {
+        return;
+      }
+      finishReject(error);
+    });
+
+    req.flushHeaders();
+  });
 }
 
 function createDeterministicRng(seed: number): () => number {
@@ -124,16 +204,7 @@ async function postWebhookPayloadWithChunkPlan(params: {
         },
       },
       (res) => {
-        const chunks: Buffer[] = [];
-        res.on("data", (chunk: Buffer | string) => {
-          chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-        });
-        res.on("end", () => {
-          finishResolve({
-            statusCode: res.statusCode ?? 0,
-            body: Buffer.concat(chunks).toString("utf-8"),
-          });
-        });
+        collectResponseBody(res, finishResolve);
       },
     );
 
@@ -346,6 +417,27 @@ describe("startTelegramWebhook", () => {
     );
   });
 
+  it("registers webhook with certificate when webhookCertPath is provided", async () => {
+    setWebhookSpy.mockClear();
+    await withStartedWebhook(
+      {
+        secret: TELEGRAM_SECRET,
+        path: TELEGRAM_WEBHOOK_PATH,
+        webhookCertPath: "/path/to/cert.pem",
+      },
+      async () => {
+        expect(setWebhookSpy).toHaveBeenCalledWith(
+          expect.any(String),
+          expect.objectContaining({
+            certificate: expect.objectContaining({
+              fileData: "/path/to/cert.pem",
+            }),
+          }),
+        );
+      },
+    );
+  });
+
   it("invokes webhook handler on matching path", async () => {
     handlerSpy.mockClear();
     createTelegramBotSpy.mockClear();
@@ -371,7 +463,34 @@ describe("startTelegramWebhook", () => {
           secret: TELEGRAM_SECRET,
         });
         expect(response.status).toBe(200);
-        expect(handlerSpy).toHaveBeenCalled();
+        expect(handlerSpy).toHaveBeenCalledWith(
+          JSON.parse(payload),
+          expect.any(Function),
+          TELEGRAM_SECRET,
+          expect.any(Function),
+        );
+      },
+    );
+  });
+
+  it("rejects unauthenticated requests before reading the request body", async () => {
+    handlerSpy.mockClear();
+    await withStartedWebhook(
+      {
+        secret: TELEGRAM_SECRET,
+        path: TELEGRAM_WEBHOOK_PATH,
+      },
+      async ({ port }) => {
+        const response = await postWebhookHeadersOnly({
+          port,
+          path: TELEGRAM_WEBHOOK_PATH,
+          declaredLength: 1_024 * 1_024,
+          secret: "wrong-secret",
+        });
+
+        expect(response.statusCode).toBe(401);
+        expect(response.body).toBe("unauthorized");
+        expect(handlerSpy).not.toHaveBeenCalled();
       },
     );
   });
@@ -412,7 +531,7 @@ describe("startTelegramWebhook", () => {
   it("keeps webhook payload readable when callback delays body read", async () => {
     handlerSpy.mockImplementationOnce(async (...args: unknown[]) => {
       const [update, reply] = args as [unknown, (json: string) => Promise<void>];
-      await sleep(50);
+      await sleep(10);
       await reply(JSON.stringify(update));
     });
 
@@ -439,7 +558,7 @@ describe("startTelegramWebhook", () => {
     const seenPayloads: string[] = [];
     const delayedHandler = async (...args: unknown[]) => {
       const [update, reply] = args as [unknown, (json: string) => Promise<void>];
-      await sleep(50);
+      await sleep(10);
       seenPayloads.push(JSON.stringify(update));
       await reply("ok");
     };
@@ -483,7 +602,7 @@ describe("startTelegramWebhook", () => {
           ) => {
             seenUpdates.push(update);
             void (async () => {
-              await sleep(50);
+              await sleep(10);
               await reply("ok");
             })();
           },
@@ -555,16 +674,8 @@ describe("startTelegramWebhook", () => {
               },
             },
             (res) => {
-              const chunks: Buffer[] = [];
-              res.on("data", (chunk: Buffer | string) => {
-                chunks.push(Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk));
-              });
-              res.on("end", () => {
-                resolve({
-                  kind: "response",
-                  statusCode: res.statusCode ?? 0,
-                  body: Buffer.concat(chunks).toString("utf-8"),
-                });
+              collectResponseBody(res, (payload) => {
+                resolve({ kind: "response", ...payload });
               });
             },
           );
@@ -597,9 +708,7 @@ describe("startTelegramWebhook", () => {
     });
 
     abort.abort();
-    await sleep(25);
-
-    expect(deleteWebhookSpy).toHaveBeenCalledTimes(1);
+    await vi.waitFor(() => expect(deleteWebhookSpy).toHaveBeenCalledTimes(1));
     expect(deleteWebhookSpy).toHaveBeenCalledWith({ drop_pending_updates: false });
   });
 });

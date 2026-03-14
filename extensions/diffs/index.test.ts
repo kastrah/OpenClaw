@@ -1,105 +1,89 @@
 import type { IncomingMessage } from "node:http";
 import { describe, expect, it, vi } from "vitest";
 import { createMockServerResponse } from "../../src/test-utils/mock-http-response.js";
+import { createTestPluginApi } from "../test-utils/plugin-api.js";
 import plugin from "./index.js";
 
 describe("diffs plugin registration", () => {
-  it("registers the tool, http handler, and prompt guidance hook", () => {
+  it("registers the tool, http route, and system-prompt guidance hook", async () => {
     const registerTool = vi.fn();
-    const registerHttpHandler = vi.fn();
+    const registerHttpRoute = vi.fn();
     const on = vi.fn();
 
-    plugin.register?.({
-      id: "diffs",
-      name: "Diffs",
-      description: "Diffs",
-      source: "test",
-      config: {},
-      runtime: {} as never,
-      logger: {
-        info() {},
-        warn() {},
-        error() {},
-      },
-      registerTool,
-      registerHook() {},
-      registerHttpHandler,
-      registerHttpRoute() {},
-      registerChannel() {},
-      registerGatewayMethod() {},
-      registerCli() {},
-      registerService() {},
-      registerProvider() {},
-      registerCommand() {},
-      resolvePath(input: string) {
-        return input;
-      },
-      on,
-    });
+    plugin.register?.(
+      createTestPluginApi({
+        id: "diffs",
+        name: "Diffs",
+        description: "Diffs",
+        source: "test",
+        config: {},
+        runtime: {} as never,
+        registerTool,
+        registerHttpRoute,
+        on,
+      }),
+    );
 
     expect(registerTool).toHaveBeenCalledTimes(1);
-    expect(registerHttpHandler).toHaveBeenCalledTimes(1);
+    expect(registerHttpRoute).toHaveBeenCalledTimes(1);
+    expect(registerHttpRoute.mock.calls[0]?.[0]).toMatchObject({
+      path: "/plugins/diffs",
+      auth: "plugin",
+      match: "prefix",
+    });
     expect(on).toHaveBeenCalledTimes(1);
     expect(on.mock.calls[0]?.[0]).toBe("before_prompt_build");
+    const beforePromptBuild = on.mock.calls[0]?.[1];
+    const result = await beforePromptBuild?.({}, {});
+    expect(result).toMatchObject({
+      prependSystemContext: expect.stringContaining("prefer the `diffs` tool"),
+    });
+    expect(result?.prependContext).toBeUndefined();
   });
 
   it("applies plugin-config defaults through registered tool and viewer handler", async () => {
     let registeredTool:
       | { execute?: (toolCallId: string, params: Record<string, unknown>) => Promise<unknown> }
       | undefined;
-    let registeredHttpHandler:
+    let registeredHttpRouteHandler:
       | ((
           req: IncomingMessage,
           res: ReturnType<typeof createMockServerResponse>,
         ) => Promise<boolean>)
       | undefined;
 
-    plugin.register?.({
-      id: "diffs",
-      name: "Diffs",
-      description: "Diffs",
-      source: "test",
-      config: {
-        gateway: {
-          port: 18789,
-          bind: "loopback",
+    plugin.register?.(
+      createTestPluginApi({
+        id: "diffs",
+        name: "Diffs",
+        description: "Diffs",
+        source: "test",
+        config: {
+          gateway: {
+            port: 18789,
+            bind: "loopback",
+          },
         },
-      },
-      pluginConfig: {
-        defaults: {
-          theme: "light",
-          background: false,
-          layout: "split",
-          showLineNumbers: false,
-          diffIndicators: "classic",
-          lineSpacing: 2,
+        pluginConfig: {
+          defaults: {
+            mode: "view",
+            theme: "light",
+            background: false,
+            layout: "split",
+            showLineNumbers: false,
+            diffIndicators: "classic",
+            lineSpacing: 2,
+          },
         },
-      },
-      runtime: {} as never,
-      logger: {
-        info() {},
-        warn() {},
-        error() {},
-      },
-      registerTool(tool) {
-        registeredTool = typeof tool === "function" ? undefined : tool;
-      },
-      registerHook() {},
-      registerHttpHandler(handler) {
-        registeredHttpHandler = handler as typeof registeredHttpHandler;
-      },
-      registerHttpRoute() {},
-      registerChannel() {},
-      registerGatewayMethod() {},
-      registerCli() {},
-      registerService() {},
-      registerProvider() {},
-      registerCommand() {},
-      resolvePath(input: string) {
-        return input;
-      },
-      on() {},
-    });
+        runtime: {} as never,
+        registerTool(tool) {
+          registeredTool = typeof tool === "function" ? undefined : tool;
+        },
+        registerHttpRoute(params) {
+          registeredHttpRouteHandler = params.handler as typeof registeredHttpRouteHandler;
+        },
+      }),
+    );
 
     const result = await registeredTool?.execute?.("tool-1", {
       before: "one\n",
@@ -109,7 +93,7 @@ describe("diffs plugin registration", () => {
       (result as { details?: Record<string, unknown> } | undefined)?.details?.viewerPath,
     );
     const res = createMockServerResponse();
-    const handled = await registeredHttpHandler?.(
+    const handled = await registeredHttpRouteHandler?.(
       localReq({
         method: "GET",
         url: viewerPath,
@@ -128,9 +112,14 @@ describe("diffs plugin registration", () => {
   });
 });
 
-function localReq(input: { method: string; url: string }): IncomingMessage {
+function localReq(input: {
+  method: string;
+  url: string;
+  headers?: IncomingMessage["headers"];
+}): IncomingMessage {
   return {
     ...input,
+    headers: input.headers ?? {},
     socket: { remoteAddress: "127.0.0.1" },
   } as unknown as IncomingMessage;
 }

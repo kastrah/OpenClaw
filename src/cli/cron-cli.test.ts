@@ -156,7 +156,11 @@ async function expectCronEditWithScheduleLookupExit(
   ).rejects.toThrow("__exit__:1");
 }
 
-async function runCronRunAndCaptureExit(params: { ran: boolean; args?: string[] }) {
+async function runCronRunAndCaptureExit(params: {
+  ran?: boolean;
+  enqueued?: boolean;
+  args?: string[];
+}) {
   resetGatewayMock();
   callGatewayFromCli.mockImplementation(
     async (method: string, _opts: unknown, callParams?: unknown) => {
@@ -164,7 +168,12 @@ async function runCronRunAndCaptureExit(params: { ran: boolean; args?: string[] 
         return { enabled: true };
       }
       if (method === "cron.run") {
-        return { ok: true, params: callParams, ran: params.ran };
+        return {
+          ok: true,
+          params: callParams,
+          ...(typeof params.ran === "boolean" ? { ran: params.ran } : {}),
+          ...(typeof params.enqueued === "boolean" ? { enqueued: params.enqueued } : {}),
+        };
       }
       return { ok: true, params: callParams };
     },
@@ -196,12 +205,17 @@ describe("cron cli", () => {
       expectedExitCode: 0,
     },
     {
+      name: "exits 0 for cron run when job is queued successfully",
+      enqueued: true,
+      expectedExitCode: 0,
+    },
+    {
       name: "exits 1 for cron run when job does not execute",
       ran: false,
       expectedExitCode: 1,
     },
-  ])("$name", async ({ ran, expectedExitCode }) => {
-    const { exitSpy } = await runCronRunAndCaptureExit({ ran });
+  ])("$name", async ({ ran, enqueued, expectedExitCode }) => {
+    const { exitSpy } = await runCronRunAndCaptureExit({ ran, enqueued });
     expect(exitSpy).toHaveBeenCalledWith(expectedExitCode);
   });
 
@@ -679,19 +693,39 @@ describe("cron cli", () => {
     expect(patch?.patch?.failureAlert).toBe(false);
   });
 
-  it("uses a longer default timeout for cron run", async () => {
-    const { runOpts } = await runCronRunAndCaptureExit({
-      ran: true,
-      args: ["cron", "run", "job-1", "--expect-final"],
-    });
-    expect(runOpts.timeout).toBe("600000");
-  });
+  it("patches failure alert mode/accountId on cron edit", async () => {
+    callGatewayFromCli.mockClear();
 
-  it("preserves explicit --timeout for cron run", async () => {
-    const { runOpts } = await runCronRunAndCaptureExit({
-      ran: true,
-      args: ["cron", "run", "job-1", "--expect-final", "--timeout", "45000"],
-    });
-    expect(runOpts.timeout).toBe("45000");
+    const program = buildProgram();
+
+    await program.parseAsync(
+      [
+        "cron",
+        "edit",
+        "job-1",
+        "--failure-alert-after",
+        "1",
+        "--failure-alert-mode",
+        "webhook",
+        "--failure-alert-account-id",
+        "bot-a",
+      ],
+      { from: "user" },
+    );
+
+    const updateCall = callGatewayFromCli.mock.calls.find((call) => call[0] === "cron.update");
+    const patch = updateCall?.[2] as {
+      patch?: {
+        failureAlert?: {
+          after?: number;
+          mode?: "announce" | "webhook";
+          accountId?: string;
+        };
+      };
+    };
+
+    expect(patch?.patch?.failureAlert?.after).toBe(1);
+    expect(patch?.patch?.failureAlert?.mode).toBe("webhook");
+    expect(patch?.patch?.failureAlert?.accountId).toBe("bot-a");
   });
 });
